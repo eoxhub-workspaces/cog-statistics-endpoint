@@ -1,0 +1,16 @@
+services:
+  cog-statistics:
+    build:
+      context: .
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./:/srv/service
+    command: gunicorn --bind=0.0.0.0:4000 --worker-class uvicorn.workers.UvicornWorker --workers=1 --threads=1 --log-level=DEBUG --reload cog_statistics.app:app
+    environment:
+      - AWS_S3_ENDPOINT=${AWS_S3_ENDPOINT}
+      - AWS_REGION=${AWS_REGION:-default}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    env_file:
+      - .env
