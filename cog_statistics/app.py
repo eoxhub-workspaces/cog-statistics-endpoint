@@ -18,6 +18,11 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from shapely.geometry import box
 from starlette_exporter import PrometheusMiddleware, handle_metrics
 
+from rio_tiler.io import COGReader  # or `from rio_tiler.io import Reader` in newer versions
+from rio_tiler.models import ImageData
+
+from rasterio.coords import BoundingBox
+
 logging.basicConfig(level=logging.INFO)
 
 logger = structlog.getLogger()
@@ -178,67 +183,152 @@ def inspect_cog(cog_url: str):
 def _process_cog(item: tuple, bbox: list[float]) -> dict:
     """
     Process a single COG file and extract statistics for the given bbox.
+    Includes timing of each step for performance diagnostics.
 
     Args:
         item: Tuple of (datetime, asset_id, cog_url)
         bbox: Bounding box [minx, miny, maxx, maxy] in EPSG:4326
 
     Returns:
-        Dictionary with datetime, asset_id, and statistics
+        Dictionary with datetime, asset_id, statistics, and step timings
     """
     dt, asset_id, cog_url = item
-    logger.info("Processing COG", asset=asset_id, url=cog_url)
-    start = time.time()
+    start_total = time.time()
+    timings = {}
+
+    logger.info(f"Processing COG {asset_id}")
 
     try:
-        # Open COG
-        da = rioxarray.open_rasterio(cog_url, masked=True)
+        # Step 1: Open COG
+        t0 = time.time()
+        with COGReader(cog_url) as cog:
+            timings['open_cog'] = time.time() - t0
 
-        # Ensure CRS is set (default to EPSG:4326 if not specified)
-        if da.rio.crs is None:
-            da.rio.write_crs("EPSG:4326", inplace=True)
+            # Step 2: Read bbox
+            t1 = time.time()
+            img = cog.part(bbox=bbox, indexes=1)  # only first band
+            timings['read_bbox'] = time.time() - t1
 
-        # Create bbox geometry in EPSG:4326
-        from shapely.geometry import mapping
-        bbox_geom = box(*bbox)
-        bbox_gdf = gpd.GeoDataFrame([1], geometry=[bbox_geom], crs="EPSG:4326")
+            # Step 3: Get masked array
+            t2 = time.time()
+            arr = img.array  # masked numpy array
+            valid_data = arr.compressed()
+            timings['mask_array'] = time.time() - t2
 
-        # Reproject bbox to match the COG's CRS
-        if da.rio.crs != "EPSG:4326":
-            bbox_gdf = bbox_gdf.to_crs(da.rio.crs)
+            if valid_data.size == 0:
+                raise ValueError("No valid data in bbox")
 
-        # Clip to bbox
-        da = da.rio.clip(bbox_gdf.geometry, bbox_gdf.crs, drop=False, all_touched=True)
+            # Step 4: Compute statistics
+            t3 = time.time()
+            result_stats = {
+                "min": float(valid_data.min()),
+                "max": float(valid_data.max()),
+                "mean": float(valid_data.mean()),
+                "stddev": float(valid_data.std())
+            }
+            timings['compute_stats'] = time.time() - t3
 
-        # Check if we have any data after clipping
-        if da.size == 0:
-            raise ValueError("No data in bbox after clipping")
+        total_duration = time.time() - start_total
+        logger.info(f"Finished processing {asset_id} in {total_duration:.2f}s")
+        logger.info(f"Step timings: {timings}")
 
-        # Compute statistics
         result = {
             "datetime": dt,
             "asset_id": asset_id,
-            "min": float(da.min().values),
-            "max": float(da.max().values),
-            "mean": float(da.mean().values),
-            "stddev": float(da.std().values),
+            **result_stats,
+            "timings": timings,
+            "total_duration": total_duration
         }
 
-        logger.info("Finished processing", asset=asset_id, duration=time.time() - start)
         return result
 
     except Exception as e:
-        logger.error(f"Error processing COG {asset_id}: {e}", exc_info=True)
-        # Return NaN values on error
-        return {
+        logger.error(f"Error processing {asset_id}: {e}")
+        raise
+class COGProcessor:
+    """
+    Helper class to process a single COG efficiently.
+    Adds detailed timing and debug info for performance diagnostics.
+    """
+
+    def __init__(self, cog_url: str):
+        self.cog_url = cog_url
+        self.reader = None
+
+    def open(self):
+        if self.reader is None:
+            t0 = time.time()
+            self.reader = COGReader(self.cog_url)
+            t1 = time.time() - t0
+            logger.info(f"Opened COG {self.cog_url} in {t1:.2f}s")
+
+    def close(self):
+        if self.reader:
+            self.reader.close()
+            self.reader = None
+
+    def process_bbox(self, item: tuple, bbox: list[float]) -> dict:
+        dt, asset_id, _ = item
+        start_total = time.time()
+        timings = {}
+
+        self.open()  # ensure reader is open
+
+        # Step 1: Read bbox
+        t0 = time.time()
+        img = self.reader.part(bbox=bbox, indexes=1)
+        timings['read_bbox'] = time.time() - t0
+
+        # Step 2: Masked array
+        t1 = time.time()
+        arr = img.array
+        valid_data = arr.compressed()
+        timings['mask_array'] = time.time() - t1
+
+        if valid_data.size == 0:
+            logger.warning(f"No valid data in bbox for asset {asset_id}")
+            raise ValueError("No valid data in bbox")
+
+        # Step 3: Compute statistics
+        t2 = time.time()
+        stats = {
+            "min": float(valid_data.min()),
+            "max": float(valid_data.max()),
+            "mean": float(valid_data.mean()),
+            "stddev": float(valid_data.std())
+        }
+        timings['compute_stats'] = time.time() - t2
+        timings['total_duration'] = time.time() - start_total
+        timings['array_shape'] = arr.shape
+        timings['valid_pixels'] = valid_data.size
+
+        logger.info(f"Processed {asset_id}: timings={timings}")
+
+        result = {
             "datetime": dt,
             "asset_id": asset_id,
-            "min": float("nan"),
-            "max": float("nan"),
-            "mean": float("nan"),
-            "stddev": float("nan"),
+            **stats,
+            "timings": timings
         }
 
+        return result
+
+def worker_process_cog(item_bbox_tuple):
+    """
+    Worker function to process a single COG + bbox
+    Args:
+        item_bbox_tuple: ((datetime, asset_id, cog_url), bbox)
+    Returns:
+        dict with statistics
+    """
+    item, bbox = item_bbox_tuple
+    cog_url = item[2]
+    processor = COGProcessor(cog_url)
+    try:
+        result = processor.process_bbox(item, bbox)
+    finally:
+        processor.close()
+    return result
 
 @app.get("/geoparquet-stats/")
 def geoparquet_stats(
@@ -351,12 +441,17 @@ def geoparquet_stats(
 
         logger.info(f"Processing {len(items_to_process)} COG assets")
 
+        items_to_process = items_to_process[:8]
+
+        logger.info(f"Processing MODIFIED {len(items_to_process)} COG assets")
+
         # Process COGs in parallel
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            results = executor.map(
-                functools.partial(_process_cog, bbox=bbox),
-                items_to_process,
-            )
+        # Create a COGReader for each worker process
+        items_with_bbox = [(item, bbox) for item in items_to_process]  # one bbox per COG
+        max_workers = 4
+
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(worker_process_cog, items_with_bbox))
 
         # Convert to response models
         response = [GeoParquetStatsItem(**r) for r in results]
