@@ -424,10 +424,6 @@ def geoparquet_stats(
 
         logger.info(f"Processing {len(items_to_process)} COG assets")
 
-        items_to_process = items_to_process[:8]
-
-        logger.info(f"Processing MODIFIED {len(items_to_process)} COG assets")
-
         # Process COGs in parallel
         # Create a COGReader for each worker process
         items_with_bbox = [(item, bbox) for item in items_to_process]  # one bbox per COG
