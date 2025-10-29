@@ -34,4 +34,4 @@ COPY . .
 
 USER www-data
 
-CMD ["gunicorn", "--bind=0.0.0.0:4000", "--worker-class", "uvicorn.workers.UvicornWorker", "--workers=3", "--log-level=INFO", "cog_statistics.app:app"]
+CMD ["gunicorn", "--bind=0.0.0.0:3000", "--worker-class", "uvicorn.workers.UvicornWorker", "--workers=4", "--log-level=INFO", "cog_statistics.app:app"]
