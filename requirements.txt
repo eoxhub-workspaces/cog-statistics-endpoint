@@ -4,7 +4,7 @@ pydantic-settings==2.5.2
 pydantic-extra-types==2.9.0
 fastapi==0.115.0
 geojson-pydantic==1.1.1
-rio-tiler==7.9.2
+rioxarray==0.18.1
 
 uvicorn==0.31.0
 gunicorn==23.0.0

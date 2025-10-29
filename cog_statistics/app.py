@@ -18,10 +18,13 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from shapely.geometry import box
 from starlette_exporter import PrometheusMiddleware, handle_metrics
 
-from rio_tiler.io import COGReader  # or `from rio_tiler.io import Reader` in newer versions
-from rio_tiler.models import ImageData
+from pydantic import BaseModel, Field, confloat
+from typing import List, Optional
+import datetime
 
-from rasterio.coords import BoundingBox
+FloatNoNan = confloat(allow_inf_nan=False)
+
+import rioxarray
 
 logging.basicConfig(level=logging.INFO)
 
@@ -57,15 +60,23 @@ def nan_to_none(a: float) -> float | None:
 FloatNoNan = Annotated[float | None, pydantic.BeforeValidator(nan_to_none)]
 
 
-class GeoParquetStatsItem(pydantic.BaseModel):
-    """Response model for individual COG statistics."""
-
-    datetime: datetime.datetime
-    asset_id: str
+class BandStats(BaseModel):
+    """Statistics for an individual band."""
+    band: str = Field(..., description="Band name or index")
+    index: Optional[int] = Field(None, description="Band index (0-based)")
     min: FloatNoNan
     max: FloatNoNan
     mean: FloatNoNan
     stddev: FloatNoNan
+    valid_pixels: Optional[int] = Field(None, description="Count of valid (non-nodata) pixels")
+
+
+class GeoParquetStatsItem(BaseModel):
+    """Response model for COG statistics, including per-band stats."""
+    datetime: datetime.datetime
+    asset_id: str
+    # Detailed band stats
+    bands: List[BandStats]
 
 
 @app.get("/")
@@ -247,75 +258,132 @@ def _process_cog(item: tuple, bbox: list[float]) -> dict:
         raise
 class COGProcessor:
     """
-    Helper class to process a single COG efficiently.
-    Adds detailed timing and debug info for performance diagnostics.
+    Process a single COG using rioxarray.
+    Adds debug info and timing.
     """
 
     def __init__(self, cog_url: str):
         self.cog_url = cog_url
-        self.reader = None
+        self.da = None  # xarray DataArray
 
     def open(self):
-        if self.reader is None:
+        """Open the COG with rioxarray (lazy loading)."""
+        if self.da is None:
             t0 = time.time()
-            self.reader = COGReader(self.cog_url)
+            self.da = rioxarray.open_rasterio(self.cog_url, masked=True, chunks=True)
             t1 = time.time() - t0
             logger.info(f"Opened COG {self.cog_url} in {t1:.2f}s")
 
     def close(self):
-        if self.reader:
-            self.reader.close()
-            self.reader = None
+        """Close the dataset."""
+        if self.da is not None:
+            self.da.close()
+            self.da = None
 
     def process_bbox(self, item: tuple, bbox: list[float]) -> dict:
+        """
+        Extract statistics for each band in a COG over a given bbox.
+        Uses rioxarray/xarray with mask-aware computations.
+        """
+
         dt, asset_id, _ = item
-        start_total = time.time()
         timings = {}
+        start_total = time.time()
 
-        self.open()  # ensure reader is open
+        self.open()
 
-        # Step 1: Read bbox
+        # Step 1: Prepare bbox in raster CRS
         t0 = time.time()
-        img = self.reader.part(bbox=bbox, indexes=1)
-        timings['read_bbox'] = time.time() - t0
+        minx, miny, maxx, maxy = bbox
+        if self.da.rio.crs is None:
+            self.da.rio.write_crs("EPSG:4326", inplace=True)
+        if self.da.rio.crs.to_string() != "EPSG:4326":
+            bbox_geom = gpd.GeoDataFrame(
+                geometry=[box(minx, miny, maxx, maxy)],
+                crs="EPSG:4326"
+            ).to_crs(self.da.rio.crs)
+            minx, miny, maxx, maxy = bbox_geom.total_bounds
+        timings["bbox_reprojection"] = time.time() - t0
 
-        # Step 2: Masked array
+        # Step 2: Clip to bbox
         t1 = time.time()
-        arr = img.array
-        valid_data = arr.compressed()
-        timings['mask_array'] = time.time() - t1
+        clipped = self.da.rio.clip_box(minx=minx, miny=miny, maxx=maxx, maxy=maxy)
+        timings["clip_bbox"] = time.time() - t1
 
-        if valid_data.size == 0:
-            logger.warning(f"No valid data in bbox for asset {asset_id}")
-            raise ValueError("No valid data in bbox")
-
-        # Step 3: Compute statistics
+        # Step 3: Compute per-band stats
         t2 = time.time()
-        stats = {
-            "min": float(valid_data.min()),
-            "max": float(valid_data.max()),
-            "mean": float(valid_data.mean()),
-            "stddev": float(valid_data.std())
-        }
-        timings['compute_stats'] = time.time() - t2
-        timings['total_duration'] = time.time() - start_total
-        timings['array_shape'] = arr.shape
-        timings['valid_pixels'] = valid_data.size
+        band_stats = []
 
-        logger.info(f"Processed {asset_id}: timings={timings}")
+        # Determine band labels from GDAL metadata
+        band_labels = []
+
+        # Check if there is a 'band' dimension
+        if "band" in clipped.dims:
+            for i in range(clipped.rio.count):
+                # Extract metadata for band i
+                # rioxarray stores GDAL attributes per band in attrs (long_name, description, etc.)
+                try:
+                    band_da = clipped.isel(band=i)
+                    name = band_da.attrs.get("long_name") or band_da.attrs.get("description") or f"band_{i+1}"
+                    band_labels.append(str(name[i]))
+                except Exception:
+                    band_labels.append(f"band_{i+1}")
+        else:
+            # Single-band raster fallback
+            name = clipped.attrs.get("long_name") or clipped.attrs.get("description") or "band_1"
+            band_labels = [name]
+
+        # If multi-variable dataset (rare but possible)
+        if isinstance(clipped, xr.Dataset):
+            datasets = {k: v for k, v in clipped.data_vars.items()}
+        else:
+            datasets = {"default": clipped}
+
+        for _, da in datasets.items():
+            for i, band_label in enumerate(band_labels):
+                try:
+                    single_band = da.isel(band=i)
+                except Exception:
+                    single_band = da  # single-band fallback
+
+                nodata = single_band.rio.nodata
+                data = single_band.astype("float64")
+
+                # Mask nodata and invalid values
+                if nodata is not None and not np.isnan(nodata):
+                    data = data.where(data != nodata)
+
+                if data.count().values == 0:
+                    continue  # skip empty bands
+
+                # Compute statistics with skipna
+                stats = {
+                    "band": band_label,
+                    "index": i,
+                    "min": float(data.min(skipna=True).values),
+                    "max": float(data.max(skipna=True).values),
+                    "mean": float(data.mean(skipna=True).values),
+                    "stddev": float(data.std(skipna=True).values),
+                    "valid_pixels": int(data.count().values),
+                }
+                band_stats.append(stats)
+
+        timings["compute_per_band"] = time.time() - t2
+        timings["total_duration"] = time.time() - start_total
+
+        logger.info(f"Processed {asset_id}: {len(band_stats)} bands, timings={timings}")
 
         result = {
             "datetime": dt,
             "asset_id": asset_id,
-            **stats,
-            "timings": timings
+            "bands": band_stats,
+            "timings": timings,
         }
-
         return result
 
 def worker_process_cog(item_bbox_tuple):
     """
-    Worker function to process a single COG + bbox
+    Worker function to process a single COG + bbox using rioxarray.
     Args:
         item_bbox_tuple: ((datetime, asset_id, cog_url), bbox)
     Returns:
@@ -323,11 +391,13 @@ def worker_process_cog(item_bbox_tuple):
     """
     item, bbox = item_bbox_tuple
     cog_url = item[2]
+
     processor = COGProcessor(cog_url)
     try:
         result = processor.process_bbox(item, bbox)
     finally:
         processor.close()
+
     return result
 
 @app.get("/geoparquet-stats/")
@@ -450,9 +520,11 @@ def geoparquet_stats(
         items_with_bbox = [(item, bbox) for item in items_to_process]  # one bbox per COG
         max_workers = 4
 
+        # Process in parallel using ProcessPoolExecutor
         with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-            results = list(executor.map(worker_process_cog, items_with_bbox))
-
+            all_results = list(executor.map(worker_process_cog, items_with_bbox))
+        results = all_results
+ 
         # Convert to response models
         response = [GeoParquetStatsItem(**r) for r in results]
         logger.info(f"Successfully processed {len(response)} items")
