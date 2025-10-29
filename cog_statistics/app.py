@@ -1,10 +1,9 @@
 import concurrent.futures
 import datetime
-import functools
 import logging
 import math
 import time
-from typing import Annotated, Any
+from typing import Annotated, List, Optional
 
 import fsspec
 import geopandas as gpd
@@ -15,16 +14,12 @@ import structlog
 import xarray as xr
 from asgi_correlation_id import CorrelationIdMiddleware
 from fastapi import FastAPI, HTTPException, Query, Request
+from pydantic import BaseModel, Field, confloat
 from shapely.geometry import box
 from starlette_exporter import PrometheusMiddleware, handle_metrics
 
-from pydantic import BaseModel, Field, confloat
-from typing import List, Optional
-import datetime
-
 FloatNoNan = confloat(allow_inf_nan=False)
 
-import rioxarray
 
 logging.basicConfig(level=logging.INFO)
 
@@ -190,76 +185,9 @@ def inspect_cog(cog_url: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-def _process_cog(item: tuple, bbox: list[float]) -> dict:
-    """
-    Process a single COG file and extract statistics for the given bbox.
-    Includes timing of each step for performance diagnostics.
-
-    Args:
-        item: Tuple of (datetime, asset_id, cog_url)
-        bbox: Bounding box [minx, miny, maxx, maxy] in EPSG:4326
-
-    Returns:
-        Dictionary with datetime, asset_id, statistics, and step timings
-    """
-    dt, asset_id, cog_url = item
-    start_total = time.time()
-    timings = {}
-
-    logger.info(f"Processing COG {asset_id}")
-
-    try:
-        # Step 1: Open COG
-        t0 = time.time()
-        with COGReader(cog_url) as cog:
-            timings['open_cog'] = time.time() - t0
-
-            # Step 2: Read bbox
-            t1 = time.time()
-            img = cog.part(bbox=bbox, indexes=1)  # only first band
-            timings['read_bbox'] = time.time() - t1
-
-            # Step 3: Get masked array
-            t2 = time.time()
-            arr = img.array  # masked numpy array
-            valid_data = arr.compressed()
-            timings['mask_array'] = time.time() - t2
-
-            if valid_data.size == 0:
-                raise ValueError("No valid data in bbox")
-
-            # Step 4: Compute statistics
-            t3 = time.time()
-            result_stats = {
-                "min": float(valid_data.min()),
-                "max": float(valid_data.max()),
-                "mean": float(valid_data.mean()),
-                "stddev": float(valid_data.std())
-            }
-            timings['compute_stats'] = time.time() - t3
-
-        total_duration = time.time() - start_total
-        logger.info(f"Finished processing {asset_id} in {total_duration:.2f}s")
-        logger.info(f"Step timings: {timings}")
-
-        result = {
-            "datetime": dt,
-            "asset_id": asset_id,
-            **result_stats,
-            "timings": timings,
-            "total_duration": total_duration
-        }
-
-        return result
-
-    except Exception as e:
-        logger.error(f"Error processing {asset_id}: {e}")
-        raise
 class COGProcessor:
     """
-    Process a single COG using rioxarray.
-    Adds debug info and timing.
+    Process a COG using rioxarray.
     """
 
     def __init__(self, cog_url: str):
@@ -269,10 +197,7 @@ class COGProcessor:
     def open(self):
         """Open the COG with rioxarray (lazy loading)."""
         if self.da is None:
-            t0 = time.time()
             self.da = rioxarray.open_rasterio(self.cog_url, masked=True, chunks=True)
-            t1 = time.time() - t0
-            logger.info(f"Opened COG {self.cog_url} in {t1:.2f}s")
 
     def close(self):
         """Close the dataset."""
@@ -285,15 +210,11 @@ class COGProcessor:
         Extract statistics for each band in a COG over a given bbox.
         Uses rioxarray/xarray with mask-aware computations.
         """
-
         dt, asset_id, _ = item
-        timings = {}
-        start_total = time.time()
 
         self.open()
 
         # Step 1: Prepare bbox in raster CRS
-        t0 = time.time()
         minx, miny, maxx, maxy = bbox
         if self.da.rio.crs is None:
             self.da.rio.write_crs("EPSG:4326", inplace=True)
@@ -303,15 +224,11 @@ class COGProcessor:
                 crs="EPSG:4326"
             ).to_crs(self.da.rio.crs)
             minx, miny, maxx, maxy = bbox_geom.total_bounds
-        timings["bbox_reprojection"] = time.time() - t0
 
         # Step 2: Clip to bbox
-        t1 = time.time()
         clipped = self.da.rio.clip_box(minx=minx, miny=miny, maxx=maxx, maxy=maxy)
-        timings["clip_bbox"] = time.time() - t1
 
         # Step 3: Compute per-band stats
-        t2 = time.time()
         band_stats = []
 
         # Determine band labels from GDAL metadata
@@ -368,16 +285,12 @@ class COGProcessor:
                 }
                 band_stats.append(stats)
 
-        timings["compute_per_band"] = time.time() - t2
-        timings["total_duration"] = time.time() - start_total
-
-        logger.info(f"Processed {asset_id}: {len(band_stats)} bands, timings={timings}")
+        logger.info(f"Processed {asset_id}, url: {self.cog_url}, bands: {len(band_stats)}")
 
         result = {
             "datetime": dt,
             "asset_id": asset_id,
             "bands": band_stats,
-            "timings": timings,
         }
         return result
 
@@ -524,7 +437,7 @@ def geoparquet_stats(
         with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
             all_results = list(executor.map(worker_process_cog, items_with_bbox))
         results = all_results
- 
+
         # Convert to response models
         response = [GeoParquetStatsItem(**r) for r in results]
         logger.info(f"Successfully processed {len(response)} items")
