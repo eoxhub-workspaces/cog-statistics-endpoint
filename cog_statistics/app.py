@@ -408,6 +408,9 @@ def geoparquet_stats(
                 assets = json.loads(assets)
 
             for asset_id, asset in assets.items():
+                # Check if asset is not null
+                if asset is None:
+                    continue
                 # Check if it's a COG
                 asset_type = asset.get("type", "")
                 roles = asset.get("roles", [])
